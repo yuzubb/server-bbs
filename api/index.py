@@ -37,7 +37,12 @@ def generate_public_id(length=7):
 
 @app.post("/post")
 async def create_post(post: PostData, request: Request):
-    client_ip = request.headers.get("x-forwarded-for", "unknown").split(',')[0].strip()
+    
+    client_ip = request.headers.get("x-original-client-ip", "unknown").strip()
+    
+    if client_ip == "unknown":
+        
+        client_ip = request.headers.get("x-forwarded-for", "unknown").split(',')[0].strip()
     
     if not post.body or len(post.body.strip()) == 0:
         raise HTTPException(status_code=400, detail="本文は必須です。")

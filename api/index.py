@@ -61,8 +61,8 @@ async def ban_user(public_id: str):
 
     # 2. ゆずbotとしてBAN通知を投稿
     notification_post = {
-        "public_id": "yuzu-bot-system-id", # システム用の固定IDを使用
-        "name": "ゆずbot",
+        "public_id": "システム", # システム用の固定IDを使用
+        "name": "システム",
         "body": f"ID: {public_id} を連投制限超過のためBANしました。",
         "client_ip": "system-ip",
         "created_at": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),

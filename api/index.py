@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from supabase import create_client, Client
 from fastapi.middleware.cors import CORSMiddleware
 
-# 環境変数の設定チェック (既存)
+# 環境変数の設定チェック
 supabase_url = os.environ.get("SUPABASE_URL")
 supabase_key = os.environ.get("SUPABASE_KEY")
 
@@ -20,7 +20,7 @@ supabase: Client = create_client(supabase_url, supabase_key)
 
 app = FastAPI()
 
-# CORS設定 (既存)
+# CORS設定
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://server-bbs.vercel.app", "http://localhost:3000", "http://127.0.0.1:8000", "*"],
@@ -30,18 +30,18 @@ app.add_middleware(
 )
 
 # 新しい連投制限設定
-RATE_LIMIT_COUNT = 5  # 投稿許容回数
-RATE_LIMIT_WINDOW_SECONDS = 10  # 制限時間枠（秒）
+RATE_LIMIT_COUNT = 5  # 投稿許容回数 (5回)
+RATE_LIMIT_WINDOW_SECONDS = 10  # 制限時間枠（秒） (10秒)
 
 class PostData(BaseModel):
     name: str = "匿名"
     body: str
 
 def generate_public_id(length=7):
+    """一意な公開IDを生成"""
     characters = string.ascii_letters + string.digits
     return ''.join(random.choice(characters) for i in range(length))
 
-# BAN処理と通知投稿を行うヘルパー関数
 async def ban_user(public_id: str):
     """
     指定されたpublic_idをBANリストに登録し、システム通知として投稿を行います。
@@ -56,13 +56,12 @@ async def ban_user(public_id: str):
         }).execute()
         print(f"BAN success: public_id {public_id} banned.")
     except Exception as e:
-        # すでにBANリストに存在する場合、PK違反でエラーになる可能性があるため、ここではログのみ
         print(f"BAN list insertion error (could be duplicate): {e}")
 
     # 2. ゆずbotとしてBAN通知を投稿
     notification_post = {
-        "public_id": "システム", # システム用の固定IDを使用
-        "name": "システム",
+        "public_id": "yuzu-bot-system-id", # システム用の固定ID
+        "name": "ゆずbot",
         "body": f"ID: {public_id} を連投制限超過のためBANしました。",
         "client_ip": "system-ip",
         "created_at": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
@@ -72,27 +71,28 @@ async def ban_user(public_id: str):
         supabase.table("posts").insert(notification_post).execute()
     except Exception as e:
         print(f"yuzu-bot notification post error: {e}")
-        # 通知投稿が失敗しても、メインの投稿処理は続行（ユーザーにはBANを通知するため）
 
 
 @app.post("/post")
 async def create_post(post: PostData, request: Request):
     
-    # IPアドレスの取得 (既存)
+    # IPアドレスの取得
     client_ip = request.headers.get("x-original-client-ip", "unknown").strip()
     if client_ip == "unknown":
         client_ip = request.headers.get("x-forwarded-for", "unknown").split(',')[0].strip()
     
-    # 入力チェック (既存)
-    if not post.body or len(post.body.strip()) == 0:
+    # 本文の整形とチェック
+    clean_body = post.body.strip()
+
+    if not clean_body or len(clean_body) == 0:
         raise HTTPException(status_code=400, detail="本文は必須です。")
         
-    if len(post.body.strip()) > 200:
+    if len(clean_body) > 200:
         raise HTTPException(status_code=400, detail="本文は200文字以下で入力してください。")
 
     assigned_public_id = None
     
-    # 1. public_idの取得または新規割り当て (既存)
+    # 1. public_idの取得または新規割り当て
     try:
         response = supabase.table("ip_to_id") \
             .select("public_id") \
@@ -121,9 +121,9 @@ async def create_post(post: PostData, request: Request):
             
         except Exception as e:
             print(f"IP-ID insertion error (DB): {e}") 
-            raise HTTPException(status_code=500, detail="ID割り当て中にエラーが発生しました。データベースの制約違反を確認してください。")
+            raise HTTPException(status_code=500, detail="ID割り当て中にエラーが発生しました。")
             
-    # 2. BANリストチェック (新規)
+    # 2. BANリストチェック
     try:
         ban_check_response = supabase.table("ban_list") \
             .select("public_id") \
@@ -140,7 +140,7 @@ async def create_post(post: PostData, request: Request):
         print(f"BAN check error: {e}")
         raise HTTPException(status_code=500, detail="BANチェック中にデータベースエラーが発生しました。")
 
-    # 3. 連投制限チェック (新規)
+    # 3. 連投制限チェック
     try:
         time_threshold = datetime.now(timezone.utc) - timedelta(seconds=RATE_LIMIT_WINDOW_SECONDS)
         time_threshold_iso = time_threshold.isoformat().replace('+00:00', 'Z')
@@ -151,7 +151,6 @@ async def create_post(post: PostData, request: Request):
             .gte("posted_at", time_threshold_iso) \
             .execute()
 
-        # Supabaseのresponse.countに正確なカウントが格納されていることを前提とします
         post_count = rate_log_response.count if hasattr(rate_log_response, 'count') else 0
         
         # 5回以上投稿があればBAN処理へ
@@ -166,35 +165,54 @@ async def create_post(post: PostData, request: Request):
         raise HTTPException(status_code=500, detail="連投チェック中にデータベースエラーが発生しました。")
     
     # 4. 投稿とアクティビティログの記録
-    current_time_iso = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    current_time_utc = datetime.now(timezone.utc)
+    current_time_iso = current_time_utc.isoformat().replace('+00:00', 'Z')
     
     new_post = {
         "public_id": assigned_public_id,
         "name": post.name.strip() or "匿名",
-        "body": post.body.strip(),
+        "body": clean_body,
         "client_ip": client_ip,
         "created_at": current_time_iso,
     }
     
     try:
-        # 投稿の挿入 (既存)
+        # ユーザー投稿の挿入
         supabase.table("posts").insert(new_post).execute()
         
-        # アクティビティログの挿入 (新規)
+        # アクティビティログの挿入
         supabase.table("post_activity_log").insert({
             "public_id": assigned_public_id,
             "posted_at": current_time_iso
         }).execute()
         
-        # 注意: 既存の post_cooldown テーブルの処理は削除しました
-
+        # 5. 「test」投稿への自動応答チェック (新規機能)
+        if clean_body == "test":
+            # ユーザー投稿よりわずかに遅延させて、タイムラインで後に表示されるようにする
+            bot_response_time_utc = current_time_utc + timedelta(milliseconds=10)
+            bot_response_iso = bot_response_time_utc.isoformat().replace('+00:00', 'Z')
+            
+            bot_post = {
+                "public_id": "yuzu-bot-system-id", 
+                "name": "ゆずbot",
+                "body": "起動確認完了",
+                "client_ip": "system-ip-check",
+                "created_at": bot_response_iso,
+            }
+            
+            try:
+                # Botの応答を投稿
+                supabase.table("posts").insert(bot_post).execute()
+            except Exception as e:
+                print(f"yuzu-bot test response post error: {e}")
+                
         return {"message": "投稿が完了しました", "public_id": new_post["public_id"]}
 
     except Exception as e:
         print(f"Database error during post insertion/log update: {e}") 
         raise HTTPException(status_code=500, detail="サーバーで投稿処理中にエラーが発生しました。")
 
-# 投稿取得エンドポイント (既存 - 変更なし)
+# 投稿取得エンドポイント
 @app.get("/posts")
 def get_posts(ip: Optional[str] = Query(None)):
     try:

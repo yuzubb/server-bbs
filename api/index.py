@@ -47,6 +47,11 @@ async def create_post(post: PostData, request: Request):
     if not post.body or len(post.body.strip()) == 0:
         raise HTTPException(status_code=400, detail="本文は必須です。")
         
+    # --- 変更点: 本文の文字数チェックを追加 ---
+    if len(post.body.strip()) > 200:
+        raise HTTPException(status_code=400, detail="本文は200文字以下で入力してください。")
+    # ---------------------------------------------
+        
     assigned_public_id = None
     
     try:

@@ -1,7 +1,7 @@
 import os
 import random
 import string
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import FastAPI, Request, HTTPException, Query
@@ -35,22 +35,50 @@ def generate_public_id(length=7):
     characters = string.ascii_letters + string.digits
     return ''.join(random.choice(characters) for i in range(length))
 
+COOLDOWN_SECONDS = 3
+
 @app.post("/post")
 async def create_post(post: PostData, request: Request):
     
     client_ip = request.headers.get("x-original-client-ip", "unknown").strip()
     
     if client_ip == "unknown":
-        
         client_ip = request.headers.get("x-forwarded-for", "unknown").split(',')[0].strip()
     
+    try:
+        cooldown_response = supabase.table("post_cooldown") \
+            .select("last_post_at") \
+            .eq("ip_address", client_ip) \
+            .limit(1) \
+            .execute()
+            
+        cooldown_data = cooldown_response.data
+        
+        if cooldown_data and len(cooldown_data) > 0:
+            last_post_at_str = cooldown_data[0].get('last_post_at')
+            last_post_at = datetime.fromisoformat(last_post_at_str.replace('Z', '+00:00')) 
+            
+            # タイムゾーン情報を付加
+            time_since_last_post = datetime.now(timezone.utc) - last_post_at.replace(tzinfo=timezone.utc)
+            
+            if time_since_last_post.total_seconds() < COOLDOWN_SECONDS:
+                wait_time = round(COOLDOWN_SECONDS - time_since_last_post.total_seconds(), 2)
+                raise HTTPException(
+                    status_code=429, 
+                    detail=f"連投は禁止されています。あと {wait_time} 秒待ってください。"
+                )
+                
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Cooldown check error: {e}")
+        raise HTTPException(status_code=500, detail="連投チェック中にデータベースエラーが発生しました。")
+
     if not post.body or len(post.body.strip()) == 0:
         raise HTTPException(status_code=400, detail="本文は必須です。")
         
-    # --- 変更点: 本文の文字数チェックを追加 ---
     if len(post.body.strip()) > 200:
         raise HTTPException(status_code=400, detail="本文は200文字以下で入力してください。")
-    # ---------------------------------------------
         
     assigned_public_id = None
     
@@ -84,21 +112,32 @@ async def create_post(post: PostData, request: Request):
             print(f"IP-ID insertion error (DB): {e}") 
             raise HTTPException(status_code=500, detail="ID割り当て中にエラーが発生しました。データベースの制約違反を確認してください。")
             
+    current_time_iso = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
     new_post = {
         "public_id": assigned_public_id,
         "name": post.name.strip() or "匿名",
         "body": post.body.strip(),
         "client_ip": client_ip,
-        "created_at": datetime.now().isoformat(),
+        "created_at": current_time_iso,
     }
     
     try:
         supabase.table("posts").insert(new_post).execute()
         
+        cooldown_update_data = {
+            "ip_address": client_ip,
+            "last_post_at": current_time_iso
+        }
+        
+        supabase.table("post_cooldown").upsert(
+            cooldown_update_data, 
+            on_conflict="ip_address"
+        ).execute()
+        
         return {"message": "投稿が完了しました", "public_id": new_post["public_id"]}
 
     except Exception as e:
-        print(f"Database error during post insertion: {e}") 
+        print(f"Database error during post insertion/cooldown update: {e}") 
         raise HTTPException(status_code=500, detail="サーバーで投稿処理中にエラーが発生しました。")
 
 @app.get("/posts")

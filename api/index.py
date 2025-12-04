@@ -36,102 +36,15 @@ def generate_public_id(length=7):
     return ''.join(random.choice(characters) for i in range(length))
 
 COOLDOWN_SECONDS = 3
-BAN_THRESHOLD = 5
-BAN_WINDOW_SECONDS = 10
 
 @app.post("/post")
 async def create_post(post: PostData, request: Request):
     
-    x_forwarded_for = request.headers.get("x-forwarded-for")
+    client_ip = request.headers.get("x-original-client-ip", "unknown").strip()
     
-    if x_forwarded_for:
-        client_ip = x_forwarded_for.split(',')[0].strip()
-    elif request.client:
-        client_ip = request.client.host
-    else:
-        client_ip = "unknown"
-
-    if client_ip == "unknown" or not client_ip:
-        raise HTTPException(status_code=400, detail="クライアントIPアドレスを特定できませんでした。")
-        
-    try:
-        ban_response = supabase.table("banned_ips") \
-            .select("public_id") \
-            .eq("ip_address", client_ip) \
-            .limit(1) \
-            .execute()
-
-        if ban_response.data and len(ban_response.data) > 0:
-            banned_public_id = ban_response.data[0].get('public_id')
-            raise HTTPException(
-                status_code=403, 
-                detail=f"IPアドレス {client_ip} はアクセス禁止されています。ID {banned_public_id}。"
-            )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Ban check error: {e}")
-        raise HTTPException(status_code=500, detail="BANチェック中にデータベースエラーが発生しました。")
-
-    if not post.body or len(post.body.strip()) == 0:
-        raise HTTPException(status_code=400, detail="本文は必須です。")
-        
-    if len(post.body.strip()) > 200:
-        raise HTTPException(status_code=400, detail="本文は200文字以下で入力してください。")
-
-    banned_keywords = ["pbm"]
+    if client_ip == "unknown":
+        client_ip = request.headers.get("x-forwarded-for", "unknown").split(',')[0].strip()
     
-    normalized_body = post.body.strip().lower()
-
-    if any(keyword in normalized_body for keyword in banned_keywords):
-        
-        now_utc = datetime.now(timezone.utc)
-        current_time_iso = now_utc.isoformat().replace('+00:00', 'Z')
-        assigned_public_id = None
-        
-        try:
-            response = supabase.table("ip_to_id") \
-                .select("public_id") \
-                .eq("ip_address", client_ip) \
-                .limit(1) \
-                .execute()
-            
-            ip_data = response.data
-            assigned_public_id = ip_data[0].get('public_id') if ip_data and len(ip_data) > 0 else None
-            
-            if not assigned_public_id:
-                new_public_id = generate_public_id()
-                supabase.table("ip_to_id").insert({
-                    "ip_address": client_ip, 
-                    "public_id": new_public_id
-                }).execute()
-                assigned_public_id = new_public_id
-                
-        except Exception as e:
-            print(f"Keyword BAN ID lookup error: {e}")
-            raise HTTPException(status_code=500, detail="キーワードBAN処理中にID検索エラーが発生しました。")
-            
-        ban_record = {
-            "ip_address": client_ip,
-            "public_id": assigned_public_id,
-            "banned_at": current_time_iso
-        }
-        
-        try:
-            supabase.table("banned_ips").upsert(
-                ban_record, 
-                on_conflict="ip_address"
-            ).execute()
-            
-            raise HTTPException(
-                status_code=403, 
-                detail=f"キーワード違反によりID {assigned_public_id} をBANしました"
-            )
-        except Exception as e:
-            print(f"Keyword BAN insertion error: {e}")
-            raise HTTPException(status_code=500, detail="キーワードBAN処理中にデータベースエラーが発生しました。")
-
     try:
         cooldown_response = supabase.table("post_cooldown") \
             .select("last_post_at") \
@@ -145,8 +58,8 @@ async def create_post(post: PostData, request: Request):
             last_post_at_str = cooldown_data[0].get('last_post_at')
             last_post_at = datetime.fromisoformat(last_post_at_str.replace('Z', '+00:00')) 
             
-            now_utc = datetime.now(timezone.utc)
-            time_since_last_post = now_utc - last_post_at.replace(tzinfo=timezone.utc)
+            # タイムゾーン情報を付加
+            time_since_last_post = datetime.now(timezone.utc) - last_post_at.replace(tzinfo=timezone.utc)
             
             if time_since_last_post.total_seconds() < COOLDOWN_SECONDS:
                 wait_time = round(COOLDOWN_SECONDS - time_since_last_post.total_seconds(), 2)
@@ -161,6 +74,12 @@ async def create_post(post: PostData, request: Request):
         print(f"Cooldown check error: {e}")
         raise HTTPException(status_code=500, detail="連投チェック中にデータベースエラーが発生しました。")
 
+    if not post.body or len(post.body.strip()) == 0:
+        raise HTTPException(status_code=400, detail="本文は必須です。")
+        
+    if len(post.body.strip()) > 200:
+        raise HTTPException(status_code=400, detail="本文は200文字以下で入力してください。")
+        
     assigned_public_id = None
     
     try:
@@ -192,45 +111,8 @@ async def create_post(post: PostData, request: Request):
         except Exception as e:
             print(f"IP-ID insertion error (DB): {e}") 
             raise HTTPException(status_code=500, detail="ID割り当て中にエラーが発生しました。データベースの制約違反を確認してください。")
-
-    now_utc = datetime.now(timezone.utc)
-    ban_window_start = now_utc - timedelta(seconds=BAN_WINDOW_SECONDS)
-    ban_window_start_iso = ban_window_start.isoformat().replace('+00:00', 'Z')
-    
-    try:
-        post_count_response = supabase.table("posts") \
-            .select("id", count="exact") \
-            .eq("client_ip", client_ip) \
-            .gte("created_at", ban_window_start_iso) \
-            .execute()
-        
-        current_post_count = post_count_response.count if post_count_response.count is not None else 0
-        total_post_count = current_post_count + 1 
-        
-        if total_post_count >= BAN_THRESHOLD:
-            ban_record = {
-                "ip_address": client_ip,
-                "public_id": assigned_public_id,
-                "banned_at": now_utc.isoformat().replace('+00:00', 'Z')
-            }
             
-            supabase.table("banned_ips").upsert(
-                ban_record, 
-                on_conflict="ip_address"
-            ).execute()
-            
-            raise HTTPException(
-                status_code=403, 
-                detail=f"ID {assigned_public_id} をBANしました"
-            )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Yuzu-bot BAN check/insertion error: {e}")
-        raise HTTPException(status_code=500, detail="ゆずbotによるBAN処理中にデータベースエラーが発生しました。")
-
-    current_time_iso = now_utc.isoformat().replace('+00:00', 'Z')
+    current_time_iso = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
     new_post = {
         "public_id": assigned_public_id,
         "name": post.name.strip() or "匿名",

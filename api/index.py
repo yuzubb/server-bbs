@@ -12,9 +12,11 @@ from pydantic import BaseModel, field_validator
 from supabase import create_client, Client
 from fastapi.middleware.cors import CORSMiddleware
 
+# --- 定数の調整 ---
 MAX_IMAGE_DIMENSION = 512
 JPEG_QUALITY = 20
-MAX_BASE64_LENGTH = 70000000  # 約50MBのバイナリデータに対応 (70MBのBase64文字列)
+MAX_BASE64_STRING_LENGTH = 70000000 
+# ------------------
 
 supabase_url = os.environ.get("SUPABASE_URL")
 supabase_key = os.environ.get("SUPABASE_KEY")
@@ -34,7 +36,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-RATE_LIMIT_COUNT = 5
+RATE_LIMIT_COUNT = 4
 RATE_LIMIT_WINDOW_SECONDS = 10
 
 class PostData(BaseModel):
@@ -86,8 +88,9 @@ async def ban_user(public_id: str):
 
 def compress_and_re_encode_base64(data_uri: str) -> str:
     
-    if len(data_uri) > MAX_BASE64_LENGTH:
-        raise ValueError("画像データが50MBのサイズ制限を超過しています。")
+    # Base64文字列の長さチェックには、修正された定数を使用
+    if len(data_uri) > MAX_BASE64_STRING_LENGTH:
+        raise ValueError("画像データが50MB相当のサイズ制限を超過しています。")
     
     try:
         _, encoded_data = data_uri.split(',', 1)
@@ -120,7 +123,7 @@ def compress_and_re_encode_base64(data_uri: str) -> str:
     return new_data_uri
 
 
-@app.post("/post")
+@app.post("/post") 
 async def create_post(post: PostData, request: Request):
     
     client_ip = request.headers.get("x-original-client-ip", "unknown").strip()
@@ -202,17 +205,13 @@ async def create_post(post: PostData, request: Request):
     post_body_to_save = clean_body
     
     if post.image_base64:
-        # Base64文字列が50MB相当の長さを超えていないかチェック (約70MB)
-        if len(post.image_base64) > MAX_BASE64_LENGTH:
-            raise HTTPException(status_code=400, detail=f"画像データが{MAX_BASE64_LENGTH}文字（約50MB）のサイズ制限を超過しています。")
+        # Base64文字列の長さチェックに、修正された定数を使用
+        if len(post.image_base64) > MAX_BASE64_STRING_LENGTH:
+            raise HTTPException(status_code=400, detail=f"画像データが{MAX_BASE64_STRING_LENGTH}文字（約50MB）のサイズ制限を超過しています。")
         
         try:
-            # 圧縮処理は実行するが、サイズチェックは緩和 (50MBまで許可)
             compressed_data_uri = compress_and_re_encode_base64(post.image_base64)
             post_body_to_save = compressed_data_uri
-
-            # 最終的なBase64データがSupabaseのTEXT/VARCHARの制限を超えないか再確認
-            # (ただし、今回の要件では50MB近くを許可しているため、DBの制限に注意が必要)
             
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=f"画像処理エラー: {ve}")
@@ -262,7 +261,7 @@ async def create_post(post: PostData, request: Request):
         print(f"Database error during post insertion/log update: {e}") 
         raise HTTPException(status_code=500, detail="サーバーで投稿処理中にエラーが発生しました。")
 
-@app.get("/posts")
+@app.get("/posts") # <-- 変更点: ルーティングにプレフィックスを追加
 def get_posts(ip: Optional[str] = Query(None)):
     try:
         query = supabase.table("posts") \

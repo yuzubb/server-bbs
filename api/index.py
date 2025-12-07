@@ -1,15 +1,20 @@
 import os
 import random
 import string
+import base64
+from io import BytesIO
+from PIL import Image
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import FastAPI, Request, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from supabase import create_client, Client
 from fastapi.middleware.cors import CORSMiddleware
 
-# 環境変数の設定チェック
+MAX_IMAGE_DIMENSION = 512
+JPEG_QUALITY = 20
+
 supabase_url = os.environ.get("SUPABASE_URL")
 supabase_key = os.environ.get("SUPABASE_KEY")
 
@@ -20,7 +25,6 @@ supabase: Client = create_client(supabase_url, supabase_key)
 
 app = FastAPI()
 
-# CORS設定
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://server-bbs.vercel.app", "http://localhost:3000", "http://127.0.0.1:8000", "*"],
@@ -29,26 +33,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 新しい連投制限設定
-RATE_LIMIT_COUNT = 5  # 投稿許容回数 (5回)
-RATE_LIMIT_WINDOW_SECONDS = 10  # 制限時間枠（秒） (10秒)
+RATE_LIMIT_COUNT = 5
+RATE_LIMIT_WINDOW_SECONDS = 10
 
 class PostData(BaseModel):
     name: str = "匿名"
-    body: str
+    body: str = ""
+    image_base64: Optional[str] = None
+    
+    @field_validator('body', mode='before')
+    def check_body_and_image(cls, v, values):
+        image_data = values.data.get('image_base64')
+        clean_body = (v or "").strip()
+        
+        if not clean_body and not image_data:
+            raise ValueError("本文または画像データのどちらか一方は必須です。")
+        
+        if clean_body and len(clean_body) > 200:
+            raise ValueError("本文は200文字以下で入力してください。")
+
+        return clean_body
 
 def generate_public_id(length=7):
-    """一意な公開IDを生成"""
     characters = string.ascii_letters + string.digits
     return ''.join(random.choice(characters) for i in range(length))
 
 async def ban_user(public_id: str):
-    """
-    指定されたpublic_idをBANリストに登録し、システム通知として投稿を行います。
-    """
     ban_reason = "連投制限（10秒間に5回以上）による自動BAN"
     
-    # 1. BANリストに登録
     try:
         supabase.table("ban_list").insert({
             "public_id": public_id,
@@ -58,9 +70,8 @@ async def ban_user(public_id: str):
     except Exception as e:
         print(f"BAN list insertion error (could be duplicate): {e}")
 
-    # 2. ゆずbotとしてBAN通知を投稿
     notification_post = {
-        "public_id": "system", # システム用の固定ID
+        "public_id": "system",
         "name": "システム",
         "body": f"ID: {public_id} を連投制限超過のためBANしました。",
         "client_ip": "0.0.0.0",
@@ -72,27 +83,50 @@ async def ban_user(public_id: str):
     except Exception as e:
         print(f"yuzu-bot notification post error: {e}")
 
+def compress_and_re_encode_base64(data_uri: str) -> str:
+    
+    try:
+        _, encoded_data = data_uri.split(',', 1)
+    except ValueError:
+        raise ValueError("無効なBase64 Data URI形式です。")
+
+    try:
+        decoded_image_data = base64.b64decode(encoded_data)
+    except Exception:
+        raise ValueError("Base64データのデコードに失敗しました。")
+
+    try:
+        img = Image.open(BytesIO(decoded_image_data))
+    except Exception:
+        raise ValueError("画像として認識できませんでした。")
+
+    img.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION))
+    
+    output_buffer = BytesIO()
+    
+    if img.mode in ('RGBA', 'P'):
+        img = img.convert('RGB')
+        
+    img.save(output_buffer, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+    
+    compressed_encoded_data = base64.b64encode(output_buffer.getvalue()).decode('utf-8')
+    
+    new_data_uri = f"data:image/jpeg;base64,{compressed_encoded_data}"
+    
+    return new_data_uri
+
 
 @app.post("/post")
 async def create_post(post: PostData, request: Request):
     
-    # IPアドレスの取得
     client_ip = request.headers.get("x-original-client-ip", "unknown").strip()
     if client_ip == "unknown":
         client_ip = request.headers.get("x-forwarded-for", "unknown").split(',')[0].strip()
     
-    # 本文の整形とチェック
     clean_body = post.body.strip()
-
-    if not clean_body or len(clean_body) == 0:
-        raise HTTPException(status_code=400, detail="本文は必須です。")
-        
-    if len(clean_body) > 200:
-        raise HTTPException(status_code=400, detail="本文は200文字以下で入力してください。")
 
     assigned_public_id = None
     
-    # 1. public_idの取得または新規割り当て
     try:
         response = supabase.table("ip_to_id") \
             .select("public_id") \
@@ -123,7 +157,6 @@ async def create_post(post: PostData, request: Request):
             print(f"IP-ID insertion error (DB): {e}") 
             raise HTTPException(status_code=500, detail="ID割り当て中にエラーが発生しました。")
             
-    # 2. BANリストチェック
     try:
         ban_check_response = supabase.table("ban_list") \
             .select("public_id") \
@@ -140,7 +173,6 @@ async def create_post(post: PostData, request: Request):
         print(f"BAN check error: {e}")
         raise HTTPException(status_code=500, detail="BANチェック中にデータベースエラーが発生しました。")
 
-    # 3. 連投制限チェック
     try:
         time_threshold = datetime.now(timezone.utc) - timedelta(seconds=RATE_LIMIT_WINDOW_SECONDS)
         time_threshold_iso = time_threshold.isoformat().replace('+00:00', 'Z')
@@ -153,7 +185,6 @@ async def create_post(post: PostData, request: Request):
 
         post_count = rate_log_response.count if hasattr(rate_log_response, 'count') else 0
         
-        # 5回以上投稿があればBAN処理へ
         if post_count >= RATE_LIMIT_COUNT:
             await ban_user(assigned_public_id)
             raise HTTPException(status_code=429, detail="連投制限（10秒間に5回以上）を超過したため、このIDはBANされました。")
@@ -164,31 +195,44 @@ async def create_post(post: PostData, request: Request):
         print(f"Rate limit check error: {e}")
         raise HTTPException(status_code=500, detail="連投チェック中にデータベースエラーが発生しました。")
     
-    # 4. 投稿とアクティビティログの記録
+    post_body_to_save = clean_body
+    is_image_post = False
+    
+    if post.image_base64:
+        try:
+            compressed_data_uri = compress_and_re_encode_base64(post.image_base64)
+            post_body_to_save = compressed_data_uri
+            is_image_post = True
+
+            if len(post_body_to_save) > 500000:
+                 raise HTTPException(status_code=400, detail="画像を極限まで圧縮しましたが、データがまだ大きすぎます。より小さな画像を試してください。")
+
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=f"画像処理エラー: {ve}")
+        except Exception as e:
+            print(f"Image compression error: {e}")
+            raise HTTPException(status_code=500, detail="画像処理中に予期せぬエラーが発生しました。")
+
     current_time_utc = datetime.now(timezone.utc)
     current_time_iso = current_time_utc.isoformat().replace('+00:00', 'Z')
     
     new_post = {
         "public_id": assigned_public_id,
         "name": post.name.strip() or "匿名",
-        "body": clean_body,
+        "body": post_body_to_save,
         "client_ip": client_ip,
         "created_at": current_time_iso,
     }
     
     try:
-        # ユーザー投稿の挿入
         supabase.table("posts").insert(new_post).execute()
         
-        # アクティビティログの挿入
         supabase.table("post_activity_log").insert({
             "public_id": assigned_public_id,
             "posted_at": current_time_iso
         }).execute()
         
-        # 5. 「test」投稿への自動応答チェック (新規機能)
-        if clean_body == "test":
-            # ユーザー投稿よりわずかに遅延させて、タイムラインで後に表示されるようにする
+        if clean_body == "test" and not is_image_post:
             bot_response_time_utc = current_time_utc + timedelta(milliseconds=10)
             bot_response_iso = bot_response_time_utc.isoformat().replace('+00:00', 'Z')
             
@@ -201,7 +245,6 @@ async def create_post(post: PostData, request: Request):
             }
             
             try:
-                # Botの応答を投稿
                 supabase.table("posts").insert(bot_post).execute()
             except Exception as e:
                 print(f"yuzu-bot test response post error: {e}")
@@ -212,7 +255,6 @@ async def create_post(post: PostData, request: Request):
         print(f"Database error during post insertion/log update: {e}") 
         raise HTTPException(status_code=500, detail="サーバーで投稿処理中にエラーが発生しました。")
 
-# 投稿取得エンドポイント
 @app.get("/posts")
 def get_posts(ip: Optional[str] = Query(None)):
     try:

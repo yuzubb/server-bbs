@@ -2,6 +2,8 @@ import os
 import random
 import string
 import base64
+import re
+import html
 from io import BytesIO
 from PIL import Image
 from datetime import datetime, timedelta, timezone
@@ -14,7 +16,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 MAX_IMAGE_DIMENSION = 512
 JPEG_QUALITY = 20
-MAX_BASE64_LENGTH = 70000000  # 約50MBのバイナリデータに対応 (70MBのBase64文字列)
+MAX_BASE64_LENGTH = 70000000
+MAX_BODY_LENGTH = 200
+MAX_NAME_LENGTH = 30
+COOLDOWN_MS = 5000
+
+BASE64_PATTERN = re.compile(r"^data:image/[a-zA-Z0-9+\-.]+;base64,[A-Za-z0-9+/=]*$")
 
 supabase_url = os.environ.get("SUPABASE_URL")
 supabase_key = os.environ.get("SUPABASE_KEY")
@@ -25,6 +32,14 @@ if not supabase_url or not supabase_key:
 supabase: Client = create_client(supabase_url, supabase_key)
 
 app = FastAPI()
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline'; object-src 'none';"
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    return response
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,8 +65,8 @@ class PostData(BaseModel):
         if not clean_body and not image_data:
             raise ValueError("本文または画像データのどちらか一方は必須です。")
         
-        if clean_body and len(clean_body) > 200:
-            raise ValueError("本文は200文字以下で入力してください。")
+        if clean_body and len(clean_body) > MAX_BODY_LENGTH:
+            raise ValueError(f"本文は{MAX_BODY_LENGTH}文字以下で入力してください。")
 
         return clean_body
 
@@ -67,9 +82,8 @@ async def ban_user(public_id: str):
             "public_id": public_id,
             "reason": ban_reason
         }).execute()
-        print(f"BAN success: public_id {public_id} banned.")
     except Exception as e:
-        print(f"BAN list insertion error (could be duplicate): {e}")
+        pass
 
     notification_post = {
         "public_id": "system",
@@ -82,10 +96,13 @@ async def ban_user(public_id: str):
     try:
         supabase.table("posts").insert(notification_post).execute()
     except Exception as e:
-        print(f"yuzu-bot notification post error: {e}")
+        pass
 
 def compress_and_re_encode_base64(data_uri: str) -> str:
     
+    if not BASE64_PATTERN.match(data_uri):
+        raise ValueError("画像データが不正な形式または悪意のあるコードを含んでいます。")
+
     if len(data_uri) > MAX_BASE64_LENGTH:
         raise ValueError("画像データが50MBのサイズ制限を超過しています。")
     
@@ -127,7 +144,11 @@ async def create_post(post: PostData, request: Request):
     if client_ip == "unknown":
         client_ip = request.headers.get("x-forwarded-for", "unknown").split(',')[0].strip()
     
-    clean_body = post.body.strip()
+    clean_name = html.escape(post.name.strip() or "匿名")
+    clean_body = html.escape(post.body.strip())
+    
+    if not clean_body and not post.image_base64:
+        raise HTTPException(status_code=400, detail="本文または画像データのどちらか一方は必須です。")
 
     assigned_public_id = None
     
@@ -144,7 +165,6 @@ async def create_post(post: PostData, request: Request):
             assigned_public_id = ip_data[0].get('public_id')
         
     except Exception as e:
-        print(f"IP lookup error: {e}")
         raise HTTPException(status_code=500, detail="ID検索中にデータベースエラーが発生しました。")
     
     if not assigned_public_id:
@@ -158,7 +178,6 @@ async def create_post(post: PostData, request: Request):
             assigned_public_id = new_public_id
             
         except Exception as e:
-            print(f"IP-ID insertion error (DB): {e}") 
             raise HTTPException(status_code=500, detail="ID割り当て中にエラーが発生しました。")
             
     try:
@@ -174,7 +193,6 @@ async def create_post(post: PostData, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"BAN check error: {e}")
         raise HTTPException(status_code=500, detail="BANチェック中にデータベースエラーが発生しました。")
 
     try:
@@ -196,28 +214,19 @@ async def create_post(post: PostData, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Rate limit check error: {e}")
         raise HTTPException(status_code=500, detail="連投チェック中にデータベースエラーが発生しました。")
     
     post_body_to_save = clean_body
     
     if post.image_base64:
-        # Base64文字列が50MB相当の長さを超えていないかチェック (約70MB)
-        if len(post.image_base64) > MAX_BASE64_LENGTH:
-            raise HTTPException(status_code=400, detail=f"画像データが{MAX_BASE64_LENGTH}文字（約50MB）のサイズ制限を超過しています。")
         
         try:
-            # 圧縮処理は実行するが、サイズチェックは緩和 (50MBまで許可)
             compressed_data_uri = compress_and_re_encode_base64(post.image_base64)
             post_body_to_save = compressed_data_uri
-
-            # 最終的なBase64データがSupabaseのTEXT/VARCHARの制限を超えないか再確認
-            # (ただし、今回の要件では50MB近くを許可しているため、DBの制限に注意が必要)
             
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=f"画像処理エラー: {ve}")
         except Exception as e:
-            print(f"Image compression error: {e}")
             raise HTTPException(status_code=500, detail="画像処理中に予期せぬエラーが発生しました。")
 
     current_time_utc = datetime.now(timezone.utc)
@@ -225,8 +234,9 @@ async def create_post(post: PostData, request: Request):
     
     new_post = {
         "public_id": assigned_public_id,
-        "name": post.name.strip() or "匿名",
+        "name": clean_name,
         "body": post_body_to_save,
+        "body_text_only": clean_body if post.image_base64 else None,
         "client_ip": client_ip,
         "created_at": current_time_iso,
     }
@@ -254,19 +264,18 @@ async def create_post(post: PostData, request: Request):
             try:
                 supabase.table("posts").insert(bot_post).execute()
             except Exception as e:
-                print(f"yuzu-bot test response post error: {e}")
+                pass
                 
         return {"message": "投稿が完了しました", "public_id": new_post["public_id"]}
 
     except Exception as e:
-        print(f"Database error during post insertion/log update: {e}") 
         raise HTTPException(status_code=500, detail="サーバーで投稿処理中にエラーが発生しました。")
 
 @app.get("/posts")
 def get_posts(ip: Optional[str] = Query(None)):
     try:
         query = supabase.table("posts") \
-            .select("public_id, name, body, created_at") \
+            .select("public_id, name, body, body_text_only, created_at") \
             .order("created_at", desc=True)
 
         if ip:
@@ -285,9 +294,8 @@ def get_posts(ip: Optional[str] = Query(None)):
                 return {"posts": []}
 
         response = query.execute()
-
+        
         return {"posts": response.data}
     
     except Exception as e:
-        print(f"Error fetching posts: {e}")
         raise HTTPException(status_code=500, detail="投稿の取得中にエラーが発生しました。")

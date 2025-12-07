@@ -8,15 +8,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import FastAPI, Request, HTTPException, Query
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from supabase import create_client, Client
 from fastapi.middleware.cors import CORSMiddleware
 
-# --- 定数の調整 ---
 MAX_IMAGE_DIMENSION = 512
 JPEG_QUALITY = 20
-MAX_BASE64_STRING_LENGTH = 70000000 
-# ------------------
+MAX_BASE64_STRING_LENGTH = 70000000
 
 supabase_url = os.environ.get("SUPABASE_URL")
 supabase_key = os.environ.get("SUPABASE_KEY")
@@ -36,7 +34,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-RATE_LIMIT_COUNT = 4
+RATE_LIMIT_COUNT = 5
 RATE_LIMIT_WINDOW_SECONDS = 10
 
 class PostData(BaseModel):
@@ -44,18 +42,19 @@ class PostData(BaseModel):
     body: str = ""
     image_base64: Optional[str] = None
     
-    @field_validator('body', mode='before')
-    def check_body_and_image(cls, v, values):
-        image_data = values.data.get('image_base64')
-        clean_body = (v or "").strip()
+    @model_validator(mode='after')
+    def check_body_and_image_data(self):
+        clean_body = (self.body or "").strip()
         
-        if not clean_body and not image_data:
+        if not clean_body and not self.image_base64:
             raise ValueError("本文または画像データのどちらか一方は必須です。")
         
         if clean_body and len(clean_body) > 200:
             raise ValueError("本文は200文字以下で入力してください。")
+            
+        self.body = clean_body
 
-        return clean_body
+        return self
 
 def generate_public_id(length=7):
     characters = string.ascii_letters + string.digits
@@ -88,7 +87,6 @@ async def ban_user(public_id: str):
 
 def compress_and_re_encode_base64(data_uri: str) -> str:
     
-    # Base64文字列の長さチェックには、修正された定数を使用
     if len(data_uri) > MAX_BASE64_STRING_LENGTH:
         raise ValueError("画像データが50MB相当のサイズ制限を超過しています。")
     
@@ -123,15 +121,13 @@ def compress_and_re_encode_base64(data_uri: str) -> str:
     return new_data_uri
 
 
-@app.post("/post") 
+@app.post("/post")
 async def create_post(post: PostData, request: Request):
     
     client_ip = request.headers.get("x-original-client-ip", "unknown").strip()
     if client_ip == "unknown":
         client_ip = request.headers.get("x-forwarded-for", "unknown").split(',')[0].strip()
     
-    clean_body = post.body.strip()
-
     assigned_public_id = None
     
     try:
@@ -202,16 +198,16 @@ async def create_post(post: PostData, request: Request):
         print(f"Rate limit check error: {e}")
         raise HTTPException(status_code=500, detail="連投チェック中にデータベースエラーが発生しました。")
     
-    post_body_to_save = clean_body
+    image_data_to_save = None
+    clean_body = post.body.strip()
     
     if post.image_base64:
-        # Base64文字列の長さチェックに、修正された定数を使用
         if len(post.image_base64) > MAX_BASE64_STRING_LENGTH:
             raise HTTPException(status_code=400, detail=f"画像データが{MAX_BASE64_STRING_LENGTH}文字（約50MB）のサイズ制限を超過しています。")
         
         try:
             compressed_data_uri = compress_and_re_encode_base64(post.image_base64)
-            post_body_to_save = compressed_data_uri
+            image_data_to_save = compressed_data_uri
             
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=f"画像処理エラー: {ve}")
@@ -225,7 +221,8 @@ async def create_post(post: PostData, request: Request):
     new_post = {
         "public_id": assigned_public_id,
         "name": post.name.strip() or "匿名",
-        "body": post_body_to_save,
+        "body": clean_body,
+        "image_data": image_data_to_save,
         "client_ip": client_ip,
         "created_at": current_time_iso,
     }
@@ -261,11 +258,11 @@ async def create_post(post: PostData, request: Request):
         print(f"Database error during post insertion/log update: {e}") 
         raise HTTPException(status_code=500, detail="サーバーで投稿処理中にエラーが発生しました。")
 
-@app.get("/posts") # <-- 変更点: ルーティングにプレフィックスを追加
+@app.get("/posts")
 def get_posts(ip: Optional[str] = Query(None)):
     try:
         query = supabase.table("posts") \
-            .select("public_id, name, body, created_at") \
+            .select("public_id, name, body, image_data, created_at") \
             .order("created_at", desc=True)
 
         if ip:

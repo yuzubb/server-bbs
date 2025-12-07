@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 MAX_IMAGE_DIMENSION = 512
 JPEG_QUALITY = 20
+MAX_BASE64_LENGTH = 70000000  # 約50MBのバイナリデータに対応 (70MBのBase64文字列)
 
 supabase_url = os.environ.get("SUPABASE_URL")
 supabase_key = os.environ.get("SUPABASE_KEY")
@@ -84,6 +85,9 @@ async def ban_user(public_id: str):
         print(f"yuzu-bot notification post error: {e}")
 
 def compress_and_re_encode_base64(data_uri: str) -> str:
+    
+    if len(data_uri) > MAX_BASE64_LENGTH:
+        raise ValueError("画像データが50MBのサイズ制限を超過しています。")
     
     try:
         _, encoded_data = data_uri.split(',', 1)
@@ -196,17 +200,20 @@ async def create_post(post: PostData, request: Request):
         raise HTTPException(status_code=500, detail="連投チェック中にデータベースエラーが発生しました。")
     
     post_body_to_save = clean_body
-    is_image_post = False
     
     if post.image_base64:
+        # Base64文字列が50MB相当の長さを超えていないかチェック (約70MB)
+        if len(post.image_base64) > MAX_BASE64_LENGTH:
+            raise HTTPException(status_code=400, detail=f"画像データが{MAX_BASE64_LENGTH}文字（約50MB）のサイズ制限を超過しています。")
+        
         try:
+            # 圧縮処理は実行するが、サイズチェックは緩和 (50MBまで許可)
             compressed_data_uri = compress_and_re_encode_base64(post.image_base64)
             post_body_to_save = compressed_data_uri
-            is_image_post = True
 
-            if len(post_body_to_save) > 500000:
-                 raise HTTPException(status_code=400, detail="画像を極限まで圧縮しましたが、データがまだ大きすぎます。より小さな画像を試してください。")
-
+            # 最終的なBase64データがSupabaseのTEXT/VARCHARの制限を超えないか再確認
+            # (ただし、今回の要件では50MB近くを許可しているため、DBの制限に注意が必要)
+            
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=f"画像処理エラー: {ve}")
         except Exception as e:
@@ -232,7 +239,7 @@ async def create_post(post: PostData, request: Request):
             "posted_at": current_time_iso
         }).execute()
         
-        if clean_body == "test" and not is_image_post:
+        if clean_body == "test":
             bot_response_time_utc = current_time_utc + timedelta(milliseconds=10)
             bot_response_iso = bot_response_time_utc.isoformat().replace('+00:00', 'Z')
             

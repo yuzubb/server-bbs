@@ -168,7 +168,7 @@ async def create_post(post: PostData, request: Request):
             .execute()
 
         if ban_check_response.data:
-            raise HTTPException(status_code=403, detail="このIDは連投制限超過によりBANされています。")
+            raise HTTPException(status_code=403, detail="このIDはBANされています。")
 
     except HTTPException:
         raise
